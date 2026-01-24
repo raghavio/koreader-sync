@@ -84,26 +84,28 @@ wrangler d1 execute reading-tracker --file schema.sql
 
 **Option A: GitHub Actions (recommended)**
 
-1. Fork this repo
-2. Add these secrets to your GitHub repo (Settings → Secrets → Actions):
-   - `CLOUDFLARE_API_TOKEN` - Your Cloudflare API token (with Workers and D1 permissions)
-   - `CLOUDFLARE_D1_DATABASE_ID` - The D1 database ID from step 1
-   - `AUTH_TOKEN` - A secret token for protecting the `/events` endpoint
-3. Push to main or trigger the workflow manually
+1. Add to your GitHub repo (Settings → Secrets and variables → Actions):
+   - Secret: `CLOUDFLARE_API_TOKEN` - Your Cloudflare API token (with Workers and D1 permissions)
+   - Variable: `CLOUDFLARE_D1_DATABASE_ID` - The D1 database ID from step 1
+2. Push to main or trigger the workflow manually
+3. Set the AUTH_TOKEN secret (one-time, persists across deploys):
+   ```bash
+   wrangler secret put AUTH_TOKEN
+   ```
 
 **Option B: Manual deploy**
 
 1. Update `wrangler.toml` with your database ID from step 1.
 
-2. Set the `AUTH_TOKEN` environment variable:
-   ```bash
-   export AUTH_TOKEN="your-secret-token-here"
-   ```
-
-3. Deploy:
+2. Deploy:
    ```bash
    wrangler login
    wrangler deploy
+   ```
+
+3. Set the AUTH_TOKEN secret:
+   ```bash
+   wrangler secret put AUTH_TOKEN
    ```
 
 Your worker will be available at: `https://koreader.{account-id}.workers.dev`
@@ -125,17 +127,24 @@ return {
 
 ### 5. Restart KOReader
 
-Open a book and your reading status will sync automatically. Check the plugin logs for sync status.
+Open a book and your reading status will sync automatically.
+
+## Debugging
+
+To enable debug logging in KOReader:
+
+1. Go to **Top menu → 🛠️ (tools icon) → More tools → Developer options → Enable debug logging**
+2. Restart KOReader and open a book
+3. Check the log file at `/koreader/crash.log` on your Kindle
+
+Look for lines containing `ReadingStatus:` to see sync status and any errors.
 
 ## Environment Variables
 
-Set in GitHub Actions secrets or `wrangler.toml`:
-
-| Variable | Description |
-|----------|-------------|
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API token with Workers and D1 permissions |
-| `CLOUDFLARE_D1_DATABASE_ID` | D1 database ID (injected at deploy time) |
-| `AUTH_TOKEN` | Secret token for protecting `/events` endpoint |
+| Variable | Where to set | Description |
+|----------|--------------|-------------|
+| `CLOUDFLARE_API_TOKEN` | GitHub secret | Cloudflare API token with Workers and D1 permissions |
+| `CLOUDFLARE_D1_DATABASE_ID` | GitHub variable | D1 database ID (injected at deploy time) |
 
 ### Creating Cloudflare API Token
 
