@@ -53,6 +53,7 @@ end
 
 function ReadingStatus:init()
     math.randomseed(os.time())
+    logger.dbg("ReadingStatus: plugin initialized, endpoint:", UPDATE_ENDPOINT)
 end
 
 -- Called when reader is ready (book opened)
@@ -124,10 +125,10 @@ function ReadingStatus:syncStatus(force, event_type)
             sink = ltn12.sink.table(response),
         }
 
-        if result then
+        if result and status == 200 then
             logger.dbg("ReadingStatus: synced", props.title, "page:", current_page, "event:", event_type)
         else
-            logger.warn("ReadingStatus: sync failed", status)
+            logger.warn("ReadingStatus: sync failed", "status:", status, "response:", table.concat(response))
         end
     end)
 end
