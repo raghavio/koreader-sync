@@ -1,0 +1,9 @@
+name = "koreader"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# D1 database - ID injected via GitHub Actions from secrets
+[[d1_databases]]
+binding = "DB"
+database_name = "reading-tracker"
+database_id = "placeholder"

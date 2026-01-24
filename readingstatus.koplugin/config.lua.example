@@ -1,0 +1,4 @@
+return {
+    update_endpoint = "<url>",
+    auth_token = "<your-auth-token>",
+}
