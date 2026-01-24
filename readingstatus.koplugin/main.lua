@@ -41,6 +41,7 @@ local SYNC_INTERVAL = 60  -- seconds between syncs
 
 -- Session tracking
 local current_session_id = nil
+local max_page_reached = 0
 
 -- Generate a simple UUID-like session ID. Taken from https://gist.github.com/jrus/3197011
 local function generateSessionId()
@@ -60,6 +61,7 @@ end
 function ReadingStatus:onReaderReady()
     -- Start a new reading session
     current_session_id = generateSessionId()
+    max_page_reached = 0
     self:syncStatus(true, "session_start")
 end
 
@@ -69,9 +71,15 @@ function ReadingStatus:onCloseDocument()
     current_session_id = nil
 end
 
--- Called on page turns (throttled)
-function ReadingStatus:onPageUpdate()
-    self:syncStatus(false, "page_turn")
+-- Called on page turns (throttled, forward movement only)
+function ReadingStatus:onPageUpdate(pageno)
+    -- Only sync when reaching a new highest page in this session.
+    -- Going back to re-read earlier pages doesn't count as progress,
+    -- and we'll sync again once the reader moves past their previous max.
+    if pageno and pageno > max_page_reached then
+        max_page_reached = pageno
+        self:syncStatus(false, "page_turn")
+    end
 end
 
 function ReadingStatus:syncStatus(force, event_type)
