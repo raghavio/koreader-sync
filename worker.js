@@ -140,11 +140,8 @@ const formatBookDetails = (book, coverUrl, stats, sessions, recentEvents) => ({
 const fetchCoverUrl = async (isbn, title, author) => {
   try {
     if (isbn) {
-      const coverUrl = `https://covers.openlibrary.org/b/isbn/${isbn}-M.jpg`;
-      const response = await fetch(coverUrl, { method: "HEAD", redirect: "manual" });
-      if (response.status === 200 || response.status === 302) {
-        return coverUrl;
-      }
+      const coverUrl = `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
+      return coverUrl;
     }
 
     if (title) {
@@ -160,7 +157,7 @@ const fetchCoverUrl = async (isbn, title, author) => {
       if (response.ok) {
         const data = await response.json();
         if (data.docs?.[0]?.cover_i) {
-          return `https://covers.openlibrary.org/b/id/${data.docs[0].cover_i}-M.jpg`;
+          return `https://covers.openlibrary.org/b/id/${data.docs[0].cover_i}-L.jpg`;
         }
       }
     }
