@@ -44,9 +44,23 @@ export default {
     if (request.method === "POST" && url.pathname === "/events") {
       return withAuth(async (req, env) => {
         try {
-          const data = await req.json();
-          await handleUpdate(env.DB, data);
-          return jsonResponse({ ok: true });
+          const events = await req.json();
+          const results = [];
+          for (const event of events) {
+            try {
+              await handleUpdate(env.DB, event);
+              results.push({ ok: true });
+            } catch (e) {
+              results.push({ ok: false, error: e.message });
+            }
+          }
+          const successCount = results.filter(r => r.ok).length;
+          return jsonResponse({
+            ok: successCount === events.length,
+            processed: events.length,
+            succeeded: successCount,
+            failed: events.length - successCount,
+          });
         } catch (e) {
           return errorResponse(e.message, 400);
         }
