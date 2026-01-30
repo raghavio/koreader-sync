@@ -44,3 +44,4 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_page_events_book ON page_events(book_id);
 CREATE INDEX IF NOT EXISTS idx_page_events_timestamp ON page_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_book ON sessions(book_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);

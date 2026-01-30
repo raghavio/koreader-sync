@@ -40,10 +40,51 @@ curl https://koreader.{account-id}.workers.dev/books/current
 ```
 
 ### GET /books
-Returns all books with aggregated stats
+Returns all books sorted by last read
 
 ```bash
 curl https://koreader.{account-id}.workers.dev/books
+```
+
+**Response:**
+```json
+{
+  "books": [
+    {
+      "id": "9780136083238",
+      "title": "The Pragmatic Programmer",
+      "author": "David Thomas, Andrew Hunt",
+      "cover_url": "https://covers.openlibrary.org/b/isbn/9780136083238-L.jpg",
+      "total_pages": 352,
+      "current_page": 148,
+      "progress_percent": 42,
+      "last_read_at": "2024-01-25T10:30:00.000Z"
+    }
+  ]
+}
+```
+
+### GET /activity
+Returns reading activity stats and a heatmap of pages read per day (last 365 days)
+
+```bash
+curl https://koreader.{account-id}.workers.dev/activity
+```
+
+**Response:**
+```json
+{
+  "stats": {
+    "total_pages_read": 2450,
+    "total_time_seconds": 180000,
+    "avg_pages_per_day": 35,
+    "avg_time_per_day_seconds": 2571
+  },
+  "heatmap": {
+    "2024-01-25": 42,
+    "2024-01-24": 38
+  }
+}
 ```
 
 ### GET /books/:bookId

@@ -67,6 +67,10 @@ export default {
       })(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/activity") {
+      return withErrorHandling(() => getActivity(env.DB))();
+    }
+
     if (request.method === "GET" && url.pathname === "/books/current") {
       return withErrorHandling(() => getCurrentReading(env.DB))();
     }
@@ -114,20 +118,6 @@ const formatBook = (book, coverUrl) => ({
   current_page: book.current_page,
   progress_percent: book.progress_percent,
   last_read_at: book.last_read_at,
-});
-
-const formatBookListItem = (book, coverUrl) => ({
-  id: book.id,
-  title: book.title,
-  author: book.author,
-  cover_url: coverUrl,
-  total_pages: book.total_pages,
-  current_page: book.current_page,
-  progress_percent: book.progress_percent,
-  total_reading_sessions: book.total_sessions,
-  total_pages_turned: book.total_page_events,
-  first_read: book.first_read,
-  last_read: book.last_read,
 });
 
 const formatBookDetails = (book, coverUrl, stats, sessions, recentEvents) => ({
@@ -263,14 +253,9 @@ const getHistory = async (db) => {
       b.title,
       b.author,
       b.total_pages,
-      b.created_at,
       rs.current_page,
       rs.progress_percent,
-      rs.last_read_at,
-      (SELECT COUNT(*) FROM sessions WHERE book_id = b.id) as total_sessions,
-      (SELECT COUNT(*) FROM page_events WHERE book_id = b.id) as total_page_events,
-      (SELECT MIN(timestamp) FROM page_events WHERE book_id = b.id) as first_read,
-      (SELECT MAX(timestamp) FROM page_events WHERE book_id = b.id) as last_read
+      rs.last_read_at
     FROM books b
     LEFT JOIN reading_status rs ON rs.book_id = b.id
     ORDER BY rs.last_read_at DESC NULLS LAST
@@ -278,7 +263,7 @@ const getHistory = async (db) => {
 
   const booksWithCovers = await Promise.all(
     books.results.map(async (book) =>
-      formatBookListItem(book, await fetchCoverUrl(book.isbn, book.title, book.author))
+      formatBook(book, await fetchCoverUrl(book.isbn, book.title, book.author))
     )
   );
 
@@ -320,4 +305,45 @@ const getBookDetails = async (db, bookId) => {
   const coverUrl = await fetchCoverUrl(book.isbn, book.title, book.author);
 
   return formatBookDetails(book, coverUrl, stats, sessions.results, recentEvents.results);
+};
+
+const getActivity = async (db) => {
+  const stats = await db.prepare(`
+    SELECT
+      COALESCE(SUM(pages_read), 0) as total_pages_read,
+      COALESCE(SUM(
+        CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER)
+      ), 0) as total_time_seconds,
+      COUNT(DISTINCT date(started_at)) as active_days
+    FROM sessions
+    WHERE ended_at IS NOT NULL
+  `).first();
+
+  const heatmap = await db.prepare(`
+    SELECT
+      date(started_at) as date,
+      SUM(pages_read) as pages
+    FROM sessions
+    WHERE ended_at IS NOT NULL
+      AND started_at >= date('now', '-365 days')
+    GROUP BY date(started_at)
+    ORDER BY date DESC
+  `).all();
+
+  const activeDays = stats.active_days || 1;
+
+  const heatmapObj = {};
+  for (const row of heatmap.results) {
+    heatmapObj[row.date] = row.pages;
+  }
+
+  return {
+    stats: {
+      total_pages_read: stats.total_pages_read,
+      total_time_seconds: stats.total_time_seconds,
+      avg_pages_per_day: Math.round(stats.total_pages_read / activeDays),
+      avg_time_per_day_seconds: Math.round(stats.total_time_seconds / activeDays),
+    },
+    heatmap: heatmapObj,
+  };
 };
