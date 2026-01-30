@@ -8,6 +8,14 @@ Sync your KOReader reading progress to a Cloudflare Worker API with D1 database 
 2. Cloudflare Worker stores events in D1 database with full history
 3. Query the API anytime - access current status, full history, and session details
 
+## Features
+
+- **Offline support** - Events are queued locally when offline and automatically synced when back online
+- **Forward-only tracking** - Only syncs page turns when moving forward through the book, ignoring re-reads of earlier pages
+- **Session tracking** - Each reading session gets a unique ID to track when you started and stopped reading
+- **Bulk event upload** - Queued events are sent in a single request for efficiency
+- **Cover images** - Book covers fetched from OpenLibrary
+
 ## API Endpoints
 
 ### GET /books/current
