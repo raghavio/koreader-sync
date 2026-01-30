@@ -7,3 +7,8 @@ compatibility_date = "2024-01-01"
 binding = "DB"
 database_name = "reading-tracker"
 database_id = "placeholder"
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
