@@ -10,7 +10,6 @@ local json = require("rapidjson")
 local logger = require("logger")
 local UIManager = require("ui/uimanager")
 local NetworkMgr = require("ui/network/manager")
-local InfoMessage = require("ui/widget/infomessage")
 local DataStorage = require("datastorage")
 
 -- Load config from config.lua
@@ -40,12 +39,11 @@ local ReadingStatus = WidgetContainer:extend{
 
 -- Throttle syncs to avoid spamming the API
 local last_sync_time = 0
-local SYNC_INTERVAL = 60  -- seconds between syncs
+local MIN_SYNC_GAP = 5  -- minimum seconds one should spend reading pages for it to sync
 
 -- Offline queue settings
-local MAX_QUEUE_SIZE = 100  -- Prevent storage bloat
-local QUEUE_FILE_NAME = "readingstatus_queue.json"
-local offline_notification_shown = false
+local QUEUE_FILE_NAME = "readingstatus_queue.ndjson"
+local queue_file_path = nil
 
 -- Session tracking
 local current_session_id = nil
@@ -62,80 +60,60 @@ end
 
 -- Queue persistence functions
 local function getQueueFilePath()
-    return DataStorage:getSettingsDir() .. "/" .. QUEUE_FILE_NAME
+    if not queue_file_path then
+        queue_file_path = DataStorage:getSettingsDir() .. "/" .. QUEUE_FILE_NAME
+    end
+    return queue_file_path
 end
 
 local function loadQueue()
     local path = getQueueFilePath()
+    local events = {}
     local file = io.open(path, "r")
     if not file then
-        return { events = {}, offline_notification_shown = false }
+        return events
     end
-    local content = file:read("*all")
+    for line in file:lines() do
+        if line and line ~= "" then
+            local ok, event = pcall(json.decode, line)
+            if ok and event then
+                table.insert(events, event)
+            end
+        end
+    end
     file:close()
-    local ok, data = pcall(json.decode, content)
-    if ok and data then
-        return {
-            events = data.events or {},
-            offline_notification_shown = data.offline_notification_shown or false
-        }
-    end
-    return { events = {}, offline_notification_shown = false }
+    logger.dbg("ReadingStatus: loadQueue - loaded events:", #events)
+    return events
 end
 
-local function saveQueue(data)
+local function clearQueue()
     local path = getQueueFilePath()
     local file = io.open(path, "w")
     if file then
-        file:write(json.encode(data))
         file:close()
-    else
-        logger.warn("ReadingStatus: failed to save queue to", path)
     end
+    logger.dbg("ReadingStatus: queue cleared")
 end
 
 local function enqueueEvent(payload)
-    local queue = loadQueue()
-    table.insert(queue.events, payload)
-    -- Drop oldest events if queue is full
-    while #queue.events > MAX_QUEUE_SIZE do
-        table.remove(queue.events, 1)
-        logger.dbg("ReadingStatus: dropped oldest event from queue (max size reached)")
+    local path = getQueueFilePath()
+    local file = io.open(path, "a")
+    if file then
+        local ok, encoded = pcall(json.encode, payload)
+        if ok and encoded then
+            file:write(encoded .. "\n")
+        end
+        file:close()
+        logger.dbg("ReadingStatus: queued event")
+    else
+        logger.warn("ReadingStatus: failed to open queue file for appending:", path)
     end
-    saveQueue(queue)
-    logger.dbg("ReadingStatus: queued event, queue size:", #queue.events)
 end
 
-local function showOfflineNotificationOnce()
-    if offline_notification_shown then
-        return
-    end
-    offline_notification_shown = true
-    -- Persist the notification state
-    local queue = loadQueue()
-    queue.offline_notification_shown = true
-    saveQueue(queue)
-    -- Show the notification
-    UIManager:show(InfoMessage:new{
-        text = "Reading progress will sync when back online.",
-        timeout = 3,
-    })
-end
-
-local function resetOfflineNotificationState()
-    if not offline_notification_shown then
-        return
-    end
-    offline_notification_shown = false
-    local queue = loadQueue()
-    queue.offline_notification_shown = false
-    saveQueue(queue)
-end
-
-local function sendEventsToServer(payloads)
-    local body = "[" .. table.concat(payloads, ",") .. "]"
+local function sendEventsToServer(events)
+    local body = json.encode(events)
     local response = {}
-    local result, status = http.request{
+    local _, status = http.request{
         url = UPDATE_ENDPOINT,
         method = "POST",
         headers = {
@@ -146,68 +124,32 @@ local function sendEventsToServer(payloads)
         source = ltn12.source.string(body),
         sink = ltn12.sink.table(response),
     }
-    if result and status == 200 then
-        local ok, data = pcall(json.decode, table.concat(response))
-        if ok and data then
-            return true, data.succeeded or 0, data.failed or 0
-        end
-        return true, 1, 0
-    end
-    return false, 0, 0, status, table.concat(response)
+    return status == 200
 end
 
 local function flushQueue()
-    local queue = loadQueue()
-    if #queue.events == 0 then
+    local events = loadQueue()
+    if #events == 0 then
         return true
     end
 
-    logger.dbg("ReadingStatus: flushing queue, events:", #queue.events)
+    logger.dbg("ReadingStatus: flushing queue, events:", #events)
 
-    local success, succeeded, failed, status, response = sendEventsToServer(queue.events)
-    if success then
-        resetOfflineNotificationState()
-        if failed == 0 then
-            queue.events = {}
-            saveQueue(queue)
-            logger.dbg("ReadingStatus: queue flushed successfully, sent:", succeeded)
-            return true
-        else
-            -- Some events failed - we don't know which, so clear anyway to avoid duplicates
-            queue.events = {}
-            saveQueue(queue)
-            logger.warn("ReadingStatus: queue flushed with errors, succeeded:", succeeded, "failed:", failed)
-            return true
-        end
+    if sendEventsToServer(events) then
+        clearQueue()
+        logger.dbg("ReadingStatus: queue flushed successfully")
+        return true
     else
-        logger.warn("ReadingStatus: queue flush failed, status:", status, "response:", response)
+        logger.warn("ReadingStatus: queue flush failed")
         return false
     end
 end
 
-local function attemptSync(payload, is_critical)
-    -- Check network status
-    if not NetworkMgr:isOnline() then
-        showOfflineNotificationOnce()
-        enqueueEvent(payload)
-        return
-    end
-
-    -- Add current event to queue and flush all at once
+local function attemptSync(payload)
     enqueueEvent(payload)
-    local success = flushQueue()
 
-    if success then
-        logger.dbg("ReadingStatus: synced successfully")
-    else
-        showOfflineNotificationOnce()
-
-        -- For critical events, register callback to retry when online
-        if is_critical then
-            NetworkMgr:willRerunWhenOnline(function()
-                flushQueue()
-            end)
-        end
+    if NetworkMgr:isOnline() then
+        flushQueue()
     end
 end
 
@@ -215,26 +157,20 @@ function ReadingStatus:init()
     math.randomseed(os.time())
     logger.dbg("ReadingStatus: plugin initialized, endpoint:", UPDATE_ENDPOINT)
 
-    -- Load persisted queue state
-    local queue = loadQueue()
-    offline_notification_shown = queue.offline_notification_shown or false
-
     -- Try flushing queue on startup if online (with delay to let system settle)
-    if #queue.events > 0 then
-        logger.dbg("ReadingStatus: found", #queue.events, "queued events")
-        UIManager:scheduleIn(5, function()
-            if NetworkMgr:isOnline() then
-                flushQueue()
-            end
-        end)
-    end
+    UIManager:scheduleIn(5, function()
+        if NetworkMgr:isOnline() then
+            flushQueue()
+        end
+    end)
 end
 
 -- Called when reader is ready (book opened)
 function ReadingStatus:onReaderReady()
     -- Start a new reading session
     current_session_id = generateSessionId()
-    max_page_reached = 0
+    -- Initialize to current page so we only track forward movement from here
+    max_page_reached = self.ui.document and self.ui.document:getCurrentPage() or 0
     self:syncStatus(true, "session_start")
 end
 
@@ -259,7 +195,7 @@ function ReadingStatus:syncStatus(force, event_type)
     local now = os.time()
 
     -- Throttle unless forced
-    if not force and (now - last_sync_time) < SYNC_INTERVAL then
+    if not force and (now - last_sync_time) < MIN_SYNC_GAP then
         return
     end
     last_sync_time = now
@@ -280,23 +216,18 @@ function ReadingStatus:syncStatus(force, event_type)
         total_pages = self.ui.document:getPageCount() or 0
     end
 
-    local payload = json.encode({
+    local payload = {
         title = props.title or "Unknown",
         author = props.authors or "Unknown",
-        isbn = props.isbn or nil,
+        isbn = props.isbn,
         current_page = current_page,
         total_pages = total_pages,
         progress = math.floor(percent * 100),
         session_id = current_session_id,
         event_type = event_type or "page_turn",
-    })
+    }
 
-    local is_critical = (event_type == "session_start" or event_type == "session_end")
-
-    -- Send async to avoid blocking UI
-    UIManager:scheduleIn(0.1, function()
-        attemptSync(payload, is_critical)
-    end)
+    attemptSync(payload)
 end
 
 return ReadingStatus
