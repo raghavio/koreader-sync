@@ -41,26 +41,12 @@ export default {
       return corsResponse();
     }
 
-    if (request.method === "POST" && url.pathname === "/events") {
+    if (request.method === "POST" && url.pathname === "/sync-stats") {
       return withAuth(async (req, env) => {
         try {
-          const events = await req.json();
-          const results = [];
-          for (const event of events) {
-            try {
-              await handleUpdate(env.DB, event);
-              results.push({ ok: true });
-            } catch (e) {
-              results.push({ ok: false, error: e.message });
-            }
-          }
-          const successCount = results.filter(r => r.ok).length;
-          return jsonResponse({
-            ok: successCount === events.length,
-            processed: events.length,
-            succeeded: successCount,
-            failed: events.length - successCount,
-          });
+          const data = await req.json();
+          await handleSyncStats(env.DB, data);
+          return jsonResponse({ ok: true });
         } catch (e) {
           return errorResponse(e.message, 400);
         }
@@ -79,82 +65,20 @@ export default {
       return withErrorHandling(() => getHistory(env.DB))();
     }
 
-    const bookMatch = url.pathname.match(/^\/books\/([^/]+)$/);
-    if (request.method === "GET" && bookMatch) {
-      const bookId = decodeURIComponent(bookMatch[1]);
-      return withErrorHandling(async () => {
-        const result = await getBookDetails(env.DB, bookId);
-        if (!result) {
-          throw Object.assign(new Error("book not found"), { status: 404 });
-        }
-        return result;
-      })();
-    }
-
     return errorResponse("not found", 404);
   },
 };
 
-// Utility Functions
-const cleanIsbn = (isbn) => isbn?.replace(/[-\s]/g, "") || null;
-
-const generateBookId = (isbn, title, author) => {
-  if (isbn) return isbn;
-  const str = `${title || ""}:${author || ""}`.toLowerCase();
-  const hash = [...str].reduce(
-    (h, c) => ((h << 5) - h + c.charCodeAt(0)) | 0,
-    0
-  );
-  return `book_${Math.abs(hash).toString(16)}`;
-};
-
-// Formatting Functions
-const formatBook = (book, coverUrl) => ({
-  id: book.id,
-  title: book.title,
-  author: book.author,
-  cover_url: coverUrl,
-  total_pages: book.total_pages,
-  current_page: book.current_page,
-  progress_percent: book.progress_percent,
-  last_read_at: book.last_read_at,
-});
-
-const formatBookDetails = (book, coverUrl, stats, sessions, recentEvents) => ({
-  id: book.id,
-  title: book.title,
-  author: book.author,
-  cover_url: coverUrl,
-  total_pages: book.total_pages,
-  current_page: book.current_page,
-  progress_percent: book.progress_percent,
-  created_at: book.created_at,
-  last_read_at: book.last_read_at,
-  stats: {
-    total_page_events: stats?.total_page_events || 0,
-    first_read: stats?.first_read,
-    last_read: stats?.last_read,
-    total_sessions: sessions.length,
-  },
-  sessions,
-  recent_events: recentEvents,
-});
-
 // External API
-const fetchCoverUrl = async (isbn, title, author) => {
+const fetchCoverUrl = async (title, authors) => {
   try {
-    if (isbn) {
-      const coverUrl = `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
-      return coverUrl;
-    }
-
     if (title) {
       const searchParams = new URLSearchParams({
         title: title,
         limit: "1",
       });
-      if (author) {
-        searchParams.set("author", author);
+      if (authors) {
+        searchParams.set("author", authors);
       }
       const searchUrl = `https://openlibrary.org/search.json?${searchParams}`;
       const response = await fetch(searchUrl);
@@ -172,68 +96,115 @@ const fetchCoverUrl = async (isbn, title, author) => {
 };
 
 // Database Operations
-const handleUpdate = async (db, data) => {
-  const { title, author, current_page, total_pages, progress, session_id, event_type } = data;
+const handleSyncStats = async (db, data) => {
+  const { book, page_stats, last_sync_time } = data;
 
-  if (!title) {
-    throw new Error("title is required");
+  if (!book?.md5) {
+    throw new Error("book.md5 is required");
   }
 
-  const isbn = cleanIsbn(data.isbn);
-  const bookId = generateBookId(isbn, title, author);
-  const now = new Date().toISOString();
+  if (!book?.title) {
+    throw new Error("book.title is required");
+  }
 
-  await db.prepare(`
-    INSERT INTO books (id, isbn, title, author, total_pages, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO NOTHING
-  `).bind(bookId, isbn || null, title, author || null, total_pages || null, now).run();
+  // Check if book exists
+  let existingBook = await db.prepare(
+    "SELECT id, cover_url FROM book WHERE md5 = ?"
+  ).bind(book.md5).first();
 
-  await db.prepare(`
-    INSERT INTO reading_status (book_id, current_page, progress_percent, last_read_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(book_id) DO UPDATE SET
-      current_page = excluded.current_page,
-      progress_percent = excluded.progress_percent,
-      last_read_at = excluded.last_read_at
-  `).bind(bookId, current_page || 0, progress || 0, now).run();
+  let bookId;
+  let coverUrl = existingBook?.cover_url;
 
-  if (event_type === "session_start") {
+  if (!existingBook) {
+    // Fetch cover for new book
+    coverUrl = await fetchCoverUrl(book.title, book.authors);
+
+    // Insert new book
+    const result = await db.prepare(`
+      INSERT INTO book (title, authors, pages, md5, cover_url, last_open)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      book.title,
+      book.authors || null,
+      book.pages || null,
+      book.md5,
+      coverUrl,
+      Math.floor(Date.now() / 1000)
+    ).run();
+
+    bookId = result.meta.last_row_id;
+  } else {
+    bookId = existingBook.id;
+
+    // Update last_open and pages if provided
     await db.prepare(`
-      INSERT OR IGNORE INTO sessions (id, book_id, started_at, start_page)
-      VALUES (?, ?, ?, ?)
-    `).bind(session_id, bookId, now, current_page || 0).run();
-  } else if (event_type === "session_end") {
-    const session = await db.prepare("SELECT start_page FROM sessions WHERE id = ?").bind(session_id).first();
-    const pagesRead = Math.max(0, (current_page || 0) - (session?.start_page || 0));
-    await db.prepare(`
-      UPDATE sessions SET ended_at = ?, end_page = ?, pages_read = ?
+      UPDATE book SET last_open = ?, pages = COALESCE(?, pages)
       WHERE id = ?
-    `).bind(now, current_page || 0, pagesRead, session_id).run();
+    `).bind(Math.floor(Date.now() / 1000), book.pages || null, bookId).run();
   }
 
-  if (session_id) {
-    await db.prepare(`
-      INSERT INTO page_events (book_id, page_number, progress_percent, session_id, timestamp)
+  // Insert page_stat_data records
+  if (page_stats && page_stats.length > 0) {
+    const insertStmt = db.prepare(`
+      INSERT OR IGNORE INTO page_stat_data (id_book, page, start_time, duration, total_pages)
       VALUES (?, ?, ?, ?, ?)
-    `).bind(bookId, current_page || 0, progress || 0, session_id, now).run();
+    `);
+
+    const batch = page_stats.map(stat =>
+      insertStmt.bind(
+        bookId,
+        stat.page,
+        stat.start_time,
+        stat.duration,
+        stat.total_pages
+      )
+    );
+
+    await db.batch(batch);
+
+    // Update book totals
+    const totals = await db.prepare(`
+      SELECT
+        COUNT(DISTINCT page) as total_read_pages,
+        COALESCE(SUM(duration), 0) as total_read_time
+      FROM page_stat_data
+      WHERE id_book = ?
+    `).bind(bookId).first();
+
+    await db.prepare(`
+      UPDATE book SET total_read_pages = ?, total_read_time = ?
+      WHERE id = ?
+    `).bind(totals.total_read_pages, totals.total_read_time, bookId).run();
   }
+
+  // Update sync state
+  const newSyncTime = page_stats?.length > 0
+    ? Math.max(...page_stats.map(s => s.start_time))
+    : last_sync_time || Math.floor(Date.now() / 1000);
+
+  await db.prepare(`
+    INSERT INTO sync_state (book_md5, last_sync_time)
+    VALUES (?, ?)
+    ON CONFLICT(book_md5) DO UPDATE SET last_sync_time = excluded.last_sync_time
+  `).bind(book.md5, newSyncTime).run();
 };
 
 const getCurrentReading = async (db) => {
   const result = await db.prepare(`
     SELECT
       b.id,
-      b.isbn,
       b.title,
-      b.author,
-      b.total_pages,
-      rs.current_page,
-      rs.progress_percent,
-      rs.last_read_at
-    FROM reading_status rs
-    JOIN books b ON b.id = rs.book_id
-    ORDER BY rs.last_read_at DESC
+      b.authors,
+      b.cover_url,
+      b.pages as total_pages,
+      b.total_read_time,
+      b.total_read_pages,
+      p.page as current_page,
+      ROUND(p.page * 100.0 / NULLIF(p.total_pages, 0), 1) as progress_percent,
+      datetime(p.start_time, 'unixepoch') as last_read_at
+    FROM page_stat_data p
+    JOIN book b ON b.id = p.id_book
+    ORDER BY p.start_time DESC
     LIMIT 1
   `).first();
 
@@ -241,100 +212,86 @@ const getCurrentReading = async (db) => {
     return { error: "no book data yet" };
   }
 
-  const coverUrl = await fetchCoverUrl(result.isbn, result.title, result.author);
-  return formatBook(result, coverUrl);
+  return {
+    id: result.id,
+    title: result.title,
+    authors: result.authors,
+    cover_url: result.cover_url,
+    total_pages: result.total_pages,
+    current_page: result.current_page,
+    progress_percent: result.progress_percent,
+    total_read_time: result.total_read_time,
+    total_read_pages: result.total_read_pages,
+    last_read_at: result.last_read_at,
+  };
 };
 
 const getHistory = async (db) => {
   const books = await db.prepare(`
     SELECT
       b.id,
-      b.isbn,
       b.title,
-      b.author,
-      b.total_pages,
-      rs.current_page,
-      rs.progress_percent,
-      rs.last_read_at
-    FROM books b
-    LEFT JOIN reading_status rs ON rs.book_id = b.id
-    ORDER BY rs.last_read_at DESC NULLS LAST
+      b.authors,
+      b.cover_url,
+      b.pages as total_pages,
+      b.total_read_time,
+      b.total_read_pages,
+      latest.page as current_page,
+      ROUND(latest.page * 100.0 / NULLIF(latest.total_pages, 0), 1) as progress_percent,
+      datetime(latest.start_time, 'unixepoch') as last_read_at
+    FROM book b
+    JOIN (
+      SELECT id_book, page, total_pages, start_time,
+        ROW_NUMBER() OVER (PARTITION BY id_book ORDER BY start_time DESC) as rn
+      FROM page_stat_data
+    ) latest ON latest.id_book = b.id AND latest.rn = 1
+    ORDER BY latest.start_time DESC
   `).all();
 
-  const booksWithCovers = await Promise.all(
-    books.results.map(async (book) =>
-      formatBook(book, await fetchCoverUrl(book.isbn, book.title, book.author))
-    )
-  );
-
-  return { books: booksWithCovers };
-};
-
-const getBookDetails = async (db, bookId) => {
-  const book = await db.prepare(`
-    SELECT
-      b.*,
-      rs.current_page,
-      rs.progress_percent,
-      rs.last_read_at
-    FROM books b
-    LEFT JOIN reading_status rs ON rs.book_id = b.id
-    WHERE b.id = ?
-  `).bind(bookId).first();
-
-  if (!book) {
-    return null;
-  }
-
-  const sessions = await db.prepare(`
-    SELECT * FROM sessions WHERE book_id = ? ORDER BY started_at DESC
-  `).bind(bookId).all();
-
-  const recentEvents = await db.prepare(`
-    SELECT * FROM page_events WHERE book_id = ? ORDER BY timestamp DESC LIMIT 100
-  `).bind(bookId).all();
-
-  const stats = await db.prepare(`
-    SELECT
-      COUNT(*) as total_page_events,
-      MIN(timestamp) as first_read,
-      MAX(timestamp) as last_read
-    FROM page_events WHERE book_id = ?
-  `).bind(bookId).first();
-
-  const coverUrl = await fetchCoverUrl(book.isbn, book.title, book.author);
-
-  return formatBookDetails(book, coverUrl, stats, sessions.results, recentEvents.results);
+  return {
+    books: books.results.map(book => ({
+      id: book.id,
+      title: book.title,
+      authors: book.authors,
+      cover_url: book.cover_url,
+      total_pages: book.total_pages,
+      current_page: book.current_page,
+      progress_percent: book.progress_percent,
+      total_read_time: book.total_read_time,
+      total_read_pages: book.total_read_pages,
+      last_read_at: book.last_read_at,
+    })),
+  };
 };
 
 const getActivity = async (db) => {
   const stats = await db.prepare(`
     SELECT
-      COALESCE(SUM(pages_read), 0) as total_pages_read,
-      COALESCE(SUM(
-        CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER)
-      ), 0) as total_time_seconds,
-      COUNT(DISTINCT date(started_at)) as active_days
-    FROM sessions
-    WHERE ended_at IS NOT NULL
+      COUNT(DISTINCT id_book || '-' || page) as total_pages_read,
+      COALESCE(SUM(duration), 0) as total_time_seconds
+    FROM page_stat_data
   `).first();
 
   const heatmap = await db.prepare(`
     SELECT
-      date(started_at) as date,
-      SUM(pages_read) as pages
-    FROM sessions
-    WHERE ended_at IS NOT NULL
-      AND started_at >= date('now', '-365 days')
-    GROUP BY date(started_at)
+      date(start_time, 'unixepoch') as date,
+      COUNT(DISTINCT id_book || '-' || page) as pages,
+      SUM(duration) as duration
+    FROM page_stat_data
+    WHERE start_time >= unixepoch('now', '-365 days')
+    GROUP BY date(start_time, 'unixepoch')
     ORDER BY date DESC
   `).all();
 
-  const activeDays = stats.active_days || 1;
+  // Count distinct active days
+  const activeDays = heatmap.results.length || 1;
 
   const heatmapObj = {};
   for (const row of heatmap.results) {
-    heatmapObj[row.date] = row.pages;
+    heatmapObj[row.date] = {
+      pages: row.pages,
+      duration: row.duration,
+    };
   }
 
   return {

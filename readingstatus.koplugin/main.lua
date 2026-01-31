@@ -1,6 +1,6 @@
 --[[
 Reading Status Sync Plugin for KOReader
-Syncs your current reading status to a Cloudflare Worker API
+Tracks page reading and syncs to a Cloudflare Worker API
 --]]
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -10,7 +10,7 @@ local json = require("rapidjson")
 local logger = require("logger")
 local UIManager = require("ui/uimanager")
 local NetworkMgr = require("ui/network/manager")
-local DataStorage = require("datastorage")
+local util = require("util")
 
 -- Load config from config.lua
 local config_loaded, config = pcall(function()
@@ -24,10 +24,10 @@ if not config_loaded or not config then
     return { disabled = true }
 end
 
-local UPDATE_ENDPOINT = config.update_endpoint
+local SYNC_ENDPOINT = config.update_endpoint
 local AUTH_TOKEN = config.auth_token
 
-if not UPDATE_ENDPOINT or not AUTH_TOKEN then
+if not SYNC_ENDPOINT or not AUTH_TOKEN then
     logger.warn("ReadingStatus: Please configure update_endpoint and auth_token in config.lua")
     return { disabled = true }
 end
@@ -37,84 +37,49 @@ local ReadingStatus = WidgetContainer:extend{
     is_doc_only = true,
 }
 
--- Throttle syncs to avoid spamming the API
-local last_sync_time = 0
-local MIN_SYNC_GAP = 5  -- minimum seconds one should spend reading pages for it to sync
+-- Sync configuration
+local SYNC_EVERY_N_PAGES = 5
 
--- Offline queue settings
-local QUEUE_FILE_NAME = "readingstatus_queue.ndjson"
-local queue_file_path = nil
+-- In-memory page stats (pending sync)
+local pending_stats = {}      -- array of {page, start_time, duration, total_pages}
+local page_turn_count = 0     -- count since last sync
 
--- Session tracking
-local current_session_id = nil
-local max_page_reached = 0
+-- Current page tracking (to calculate duration)
+local current_page_start = nil  -- timestamp when current page was opened
+local current_page = nil        -- current page number
+local current_book = nil        -- {title, authors, pages, md5}
 
--- Generate a simple UUID-like session ID. Taken from https://gist.github.com/jrus/3197011
-local function generateSessionId()
-    local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
-    return string.gsub(template, "[xy]", function(c)
-        local v = (c == "x") and math.random(0, 0xf) or math.random(8, 0xb)
-        return string.format("%x", v)
-    end)
+-- Record a page stat entry to pending queue
+local function recordPageStat(page, duration)
+    if duration > 0 and current_book then
+        table.insert(pending_stats, {
+            page = page,
+            start_time = os.time() - duration,
+            duration = duration,
+            total_pages = current_book.pages or 0,
+        })
+        logger.dbg("ReadingStatus: recorded page", page, "duration", duration)
+    end
 end
 
--- Queue persistence functions
-local function getQueueFilePath()
-    if not queue_file_path then
-        queue_file_path = DataStorage:getSettingsDir() .. "/" .. QUEUE_FILE_NAME
-    end
-    return queue_file_path
-end
-
-local function loadQueue()
-    local path = getQueueFilePath()
-    local events = {}
-    local file = io.open(path, "r")
-    if not file then
-        return events
-    end
-    for line in file:lines() do
-        if line and line ~= "" then
-            local ok, event = pcall(json.decode, line)
-            if ok and event then
-                table.insert(events, event)
-            end
+-- Finalize current page's duration before moving on
+local function flushCurrentPage()
+    if current_page and current_page_start then
+        local duration = os.time() - current_page_start
+        -- Only record if within reasonable bounds (5-90 seconds like KOReader)
+        if duration >= 5 and duration <= 90 then
+            recordPageStat(current_page, duration)
         end
-    end
-    file:close()
-    logger.dbg("ReadingStatus: loadQueue - loaded events:", #events)
-    return events
-end
-
-local function clearQueue()
-    local path = getQueueFilePath()
-    local file = io.open(path, "w")
-    if file then
-        file:close()
-    end
-    logger.dbg("ReadingStatus: queue cleared")
-end
-
-local function enqueueEvent(payload)
-    local path = getQueueFilePath()
-    local file = io.open(path, "a")
-    if file then
-        local ok, encoded = pcall(json.encode, payload)
-        if ok and encoded then
-            file:write(encoded .. "\n")
-        end
-        file:close()
-        logger.dbg("ReadingStatus: queued event")
-    else
-        logger.warn("ReadingStatus: failed to open queue file for appending:", path)
+        current_page_start = nil
     end
 end
 
-local function sendEventsToServer(events)
-    local body = json.encode(events)
+-- Send sync data to server
+local function sendSyncToServer(data)
+    local body = json.encode(data)
     local response = {}
     local _, status = http.request{
-        url = UPDATE_ENDPOINT,
+        url = SYNC_ENDPOINT,
         method = "POST",
         headers = {
             ["Content-Type"] = "application/json",
@@ -127,107 +92,107 @@ local function sendEventsToServer(events)
     return status == 200
 end
 
-local function flushQueue()
-    local events = loadQueue()
-    if #events == 0 then
+-- Sync pending stats to API
+local function syncToServer(force)
+    if #pending_stats == 0 and not force then
         return true
     end
-
-    logger.dbg("ReadingStatus: flushing queue, events:", #events)
-
-    if sendEventsToServer(events) then
-        clearQueue()
-        logger.dbg("ReadingStatus: queue flushed successfully")
-        return true
-    else
-        logger.warn("ReadingStatus: queue flush failed")
+    if not NetworkMgr:isOnline() then
+        logger.dbg("ReadingStatus: offline, skipping sync")
+        return false, "offline"
+    end
+    if not current_book then
         return false
     end
-end
 
-local function attemptSync(payload)
-    enqueueEvent(payload)
+    logger.dbg("ReadingStatus: syncing", #pending_stats, "page stats for:", current_book.title)
 
-    if NetworkMgr:isOnline() then
-        flushQueue()
+    local payload = {
+        book = current_book,
+        page_stats = pending_stats,
+    }
+
+    if sendSyncToServer(payload) then
+        logger.dbg("ReadingStatus: sync successful")
+        pending_stats = {}  -- clear on success
+        page_turn_count = 0
+        return true
     end
+    logger.warn("ReadingStatus: sync failed for:", current_book.title)
+    return false
 end
 
 function ReadingStatus:init()
-    math.randomseed(os.time())
-    logger.dbg("ReadingStatus: plugin initialized, endpoint:", UPDATE_ENDPOINT)
-
-    -- Try flushing queue on startup if online (with delay to let system settle)
-    UIManager:scheduleIn(5, function()
-        if NetworkMgr:isOnline() then
-            flushQueue()
-        end
-    end)
+    logger.dbg("ReadingStatus: plugin initialized, endpoint:", SYNC_ENDPOINT)
 end
 
 -- Called when reader is ready (book opened)
 function ReadingStatus:onReaderReady()
-    -- Start a new reading session
-    current_session_id = generateSessionId()
-    -- Initialize to current page so we only track forward movement from here
-    max_page_reached = self.ui.document and self.ui.document:getCurrentPage() or 0
-    self:syncStatus(true, "session_start")
+    local props = self.ui.doc_props or {}
+    if not props.title then
+        logger.dbg("ReadingStatus: no title, skipping")
+        return
+    end
+
+    -- Generate md5 from document file (same as KOReader's statistics plugin)
+    local md5 = util.partialMD5(self.ui.document.file)
+
+    current_book = {
+        title = props.title,
+        authors = props.authors,
+        pages = self.ui.document:getPageCount(),
+        md5 = md5,
+    }
+    current_page = self.ui.document:getCurrentPage()
+    current_page_start = os.time()
+    page_turn_count = 0
+    pending_stats = {}
+
+    logger.dbg("ReadingStatus: opened book:", current_book.title, "page:", current_page)
+end
+
+-- Called on page turns
+function ReadingStatus:onPageUpdate(pageno)
+    if not current_book then return end
+
+    -- Flush previous page's duration
+    flushCurrentPage()
+
+    -- Start tracking new page
+    current_page = pageno
+    current_page_start = os.time()
+    page_turn_count = page_turn_count + 1
+
+    -- Sync every N pages
+    if page_turn_count >= SYNC_EVERY_N_PAGES then
+        UIManager:scheduleIn(0.5, function()
+            syncToServer(false)
+        end)
+    end
 end
 
 -- Called when closing the document
 function ReadingStatus:onCloseDocument()
-    self:syncStatus(true, "session_end")
-    current_session_id = nil
+    flushCurrentPage()
+    syncToServer(true)  -- force sync remaining
+    current_book = nil
+    current_page = nil
+    current_page_start = nil
+    pending_stats = {}
+    page_turn_count = 0
+    logger.dbg("ReadingStatus: closed document, synced remaining stats")
 end
 
--- Called on page turns (throttled, forward movement only)
-function ReadingStatus:onPageUpdate(pageno)
-    -- Only sync when reaching a new highest page in this session.
-    -- Going back to re-read earlier pages doesn't count as progress,
-    -- and we'll sync again once the reader moves past their previous max.
-    if pageno and pageno > max_page_reached then
-        max_page_reached = pageno
-        self:syncStatus(false, "page_turn")
+-- Called when device is about to suspend (cover closed, sleep button, auto-sleep)
+function ReadingStatus:onSuspend()
+    if not current_book then return end
+    flushCurrentPage()
+    syncToServer(true)  -- sync before sleep
+    -- Reset page start time since we'll resume from suspend
+    if current_page then
+        current_page_start = os.time()
     end
-end
-
-function ReadingStatus:syncStatus(force, event_type)
-    local now = os.time()
-
-    -- Throttle unless forced
-    if not force and (now - last_sync_time) < MIN_SYNC_GAP then
-        return
-    end
-    last_sync_time = now
-
-    -- Get document properties
-    local props = self.ui.doc_props or {}
-    local percent = 0
-    local current_page = 0
-    local total_pages = 0
-
-    if self.ui.doc_settings then
-        percent = self.ui.doc_settings:readSetting("percent_finished") or 0
-    end
-
-    -- Get page info from the document
-    if self.ui.document then
-        current_page = self.ui.document:getCurrentPage() or 0
-        total_pages = self.ui.document:getPageCount() or 0
-    end
-
-    local payload = {
-        title = props.title or "Unknown",
-        author = props.authors or "Unknown",
-        isbn = props.isbn,
-        current_page = current_page,
-        total_pages = total_pages,
-        progress = math.floor(percent * 100),
-        session_id = current_session_id,
-        event_type = event_type or "page_turn",
-    }
-
-    attemptSync(payload)
+    logger.dbg("ReadingStatus: suspended, synced stats")
 end
 
 return ReadingStatus

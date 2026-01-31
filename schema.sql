@@ -1,47 +1,32 @@
--- Books table
-CREATE TABLE IF NOT EXISTS books (
-  id TEXT PRIMARY KEY,  -- ISBN if available, otherwise hash(title+author)
-  isbn TEXT,            -- stored separately for lookups even when not used as ID
-  title TEXT NOT NULL,
-  author TEXT,
-  total_pages INTEGER,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
--- Current reading status (one row per book, updated on each event)
-CREATE TABLE IF NOT EXISTS reading_status (
-  book_id TEXT PRIMARY KEY,
-  current_page INTEGER,
-  progress_percent REAL,
-  last_read_at TEXT,
-  FOREIGN KEY(book_id) REFERENCES books(id)
-);
-
--- Page turn events (granular tracking)
-CREATE TABLE IF NOT EXISTS page_events (
+-- Book table - matches KOReader's structure + cover_url
+CREATE TABLE IF NOT EXISTS book (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  book_id TEXT NOT NULL,
-  page_number INTEGER,
-  progress_percent REAL,
-  session_id TEXT,
-  timestamp TEXT DEFAULT (datetime('now')),
-  FOREIGN KEY(book_id) REFERENCES books(id)
+  title TEXT,
+  authors TEXT,
+  pages INTEGER,                      -- total pages
+  md5 TEXT,                           -- KOReader's unique identifier
+  cover_url TEXT,                     -- fetched once from OpenLibrary
+  total_read_time INTEGER DEFAULT 0,  -- cached sum from page_stat_data
+  total_read_pages INTEGER DEFAULT 0, -- cached count from page_stat_data
+  last_open INTEGER                   -- unix timestamp
 );
+CREATE UNIQUE INDEX IF NOT EXISTS book_md5 ON book(md5);
 
--- Reading sessions
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  book_id TEXT NOT NULL,
-  started_at TEXT,
-  ended_at TEXT,
-  start_page INTEGER,
-  end_page INTEGER,
-  pages_read INTEGER,
-  FOREIGN KEY(book_id) REFERENCES books(id)
+-- Page stat data - matches KOReader exactly
+CREATE TABLE IF NOT EXISTS page_stat_data (
+  id_book INTEGER NOT NULL,
+  page INTEGER NOT NULL DEFAULT 0,
+  start_time INTEGER NOT NULL DEFAULT 0,
+  duration INTEGER NOT NULL DEFAULT 0,
+  total_pages INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (id_book, page, start_time),
+  FOREIGN KEY(id_book) REFERENCES book(id)
 );
+CREATE INDEX IF NOT EXISTS idx_page_stat_book ON page_stat_data(id_book);
+CREATE INDEX IF NOT EXISTS idx_page_stat_time ON page_stat_data(start_time);
 
--- Indexes for common queries
-CREATE INDEX IF NOT EXISTS idx_page_events_book ON page_events(book_id);
-CREATE INDEX IF NOT EXISTS idx_page_events_timestamp ON page_events(timestamp);
-CREATE INDEX IF NOT EXISTS idx_sessions_book ON sessions(book_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
+-- Sync state - track last sync per book
+CREATE TABLE IF NOT EXISTS sync_state (
+  book_md5 TEXT PRIMARY KEY,
+  last_sync_time INTEGER NOT NULL DEFAULT 0
+);
