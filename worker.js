@@ -201,7 +201,7 @@ const getCurrentReading = async (db) => {
       b.total_read_pages,
       p.page as current_page,
       ROUND(p.page * 100.0 / NULLIF(p.total_pages, 0), 1) as progress_percent,
-      datetime(p.start_time, 'unixepoch') as last_read_at
+      strftime('%Y-%m-%dT%H:%M:%SZ', p.start_time, 'unixepoch') as last_read_at
     FROM page_stat_data p
     JOIN book b ON b.id = p.id_book
     ORDER BY p.start_time DESC
@@ -238,7 +238,7 @@ const getHistory = async (db) => {
       b.total_read_pages,
       latest.page as current_page,
       ROUND(latest.page * 100.0 / NULLIF(latest.total_pages, 0), 1) as progress_percent,
-      datetime(latest.start_time, 'unixepoch') as last_read_at
+      strftime('%Y-%m-%dT%H:%M:%SZ', latest.start_time, 'unixepoch') as last_read_at
     FROM book b
     JOIN (
       SELECT id_book, page, total_pages, start_time,
